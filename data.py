@@ -30,15 +30,31 @@ AA_3TO1 = {
     "VAL": "V",
 }
 AA_LIST = list("ARNDCQEGHILKMFPSTWYV")
-AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
-UNK_AA_IDX = len(AA_LIST)
+UNK_AA = "X"
 
 
-def residue_onehot(res_name):
-    aa = AA_3TO1.get(res_name, "X")
-    vec = torch.zeros(len(AA_LIST) + 1, dtype=torch.float)
-    vec[AA_TO_IDX.get(aa, UNK_AA_IDX)] = 1.0
-    return vec
+class ProteinTokenizer:
+    def __init__(self):
+        # Minimal AA vocabulary with pad + UNK.
+        vocab = [UNK_AA] + AA_LIST
+        self.pad_token = "<pad>"
+        self.pad_idx = 0
+        self.vocab = {self.pad_token: self.pad_idx}
+        for aa in vocab:
+            self.vocab[aa] = len(self.vocab)
+        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+
+    def encode(self, seq):
+        ids = []
+        for aa in seq:
+            if aa == " ":
+                continue
+            ids.append(self.vocab.get(aa, self.vocab[UNK_AA]))
+        return torch.tensor(ids, dtype=torch.long)
+
+    @property
+    def vocab_size(self):
+        return len(self.vocab)
 
 
 def read_pocket_pdb(pdb_path):
@@ -57,17 +73,19 @@ def read_pocket_pdb(pdb_path):
         coords = [atom.coord for atom in residue.get_atoms()]
         if not coords:
             continue
+        # Residue center as the structural coordinate.
         coord = torch.tensor(coords, dtype=torch.float).mean(dim=0)
         residues.append((residue.get_parent().id, res_id, residue.get_resname(), coord))
 
+    # Enforce deterministic ordering across chains and residue ids.
     residues.sort(key=lambda x: (x[0], x[1]))
     coords = [r[3] for r in residues]
-    feats = [residue_onehot(r[2]) for r in residues]
+    seq = "".join(AA_3TO1.get(r[2], UNK_AA) for r in residues)
 
     if not coords:
         raise ValueError(f"No residues parsed from {pdb_path}")
 
-    return torch.stack(coords, dim=0), torch.stack(feats, dim=0)
+    return seq, torch.stack(coords, dim=0)
 
 
 def atom_features_from_atomic_num(atomic_num, degree=0, formal_charge=0, aromatic=0):
@@ -84,6 +102,7 @@ def read_ligand_sdf(sdf_path):
     for atom in mol.GetAtoms():
         pos = conf.GetAtomPosition(atom.GetIdx())
         coords.append([pos.x, pos.y, pos.z])
+        # Simple atom-level features; extend as needed.
         feats.append(
             atom_features_from_atomic_num(
                 atom.GetAtomicNum(),
@@ -109,6 +128,7 @@ class CrossDockedPocket10Dataset(Dataset):
         if split_path and subset:
             entries = _load_split_entries(split_path, subset)
             for pocket_fn, ligand_fn in entries:
+                # split_by_name.pt stores relative paths under crossdocked_pocket10
                 pocket_pdb = os.path.join(root_dir, subdir, pocket_fn)
                 ligand_sdf = os.path.join(root_dir, subdir, ligand_fn)
                 if os.path.exists(pocket_pdb) and os.path.exists(ligand_sdf):
@@ -148,17 +168,21 @@ class CrossDockedPocket10Dataset(Dataset):
 
     def __getitem__(self, idx):
         pocket_pdb, sdf_path = self.samples[idx]
-        pocket_coords, pocket_feats = read_pocket_pdb(pocket_pdb)
+        pocket_seq, pocket_coords = read_pocket_pdb(pocket_pdb)
         drug_coords, drug_feats, smiles = read_ligand_sdf(sdf_path)
         if smiles is None:
             raise ValueError(f"Failed to read ligand from {sdf_path}")
-        return pocket_feats, pocket_coords, drug_feats, drug_coords, smiles
+        pocket_seq_spaced = " ".join(list(pocket_seq))
+        return pocket_seq_spaced, pocket_coords, drug_feats, drug_coords, smiles
 
 
 def pad_stack(tensors, pad_value=0.0):
     max_len = max(t.size(0) for t in tensors)
-    feat_dim = tensors[0].size(1)
-    out = tensors[0].new_full((len(tensors), max_len, feat_dim), pad_value)
+    if tensors[0].dim() == 1:
+        out = tensors[0].new_full((len(tensors), max_len), pad_value)
+    else:
+        feat_dim = tensors[0].size(1)
+        out = tensors[0].new_full((len(tensors), max_len, feat_dim), pad_value)
     mask = torch.zeros(len(tensors), max_len, dtype=torch.bool)
     for i, t in enumerate(tensors):
         out[i, : t.size(0)] = t
@@ -166,10 +190,14 @@ def pad_stack(tensors, pad_value=0.0):
     return out, mask
 
 
-def collate_fn(batch, tokenizer, max_len=128):
-    pocket_feats, pocket_coords, drug_feats, drug_coords, smiles = zip(*batch)
+def collate_fn(batch, tokenizer, max_len=128, protein_tokenizer=None):
+    pocket_seq, pocket_coords, drug_feats, drug_coords, smiles = zip(*batch)
 
-    pocket_feats, pocket_mask = pad_stack(pocket_feats)
+    if protein_tokenizer is None:
+        protein_tokenizer = ProteinTokenizer()
+    # Protein tokens from space-separated AA sequence.
+    pocket_tokens = [protein_tokenizer.encode(seq) for seq in pocket_seq]
+    pocket_tokens, pocket_mask = pad_stack(pocket_tokens, pad_value=protein_tokenizer.pad_idx)
     pocket_coords, _ = pad_stack(pocket_coords)
     drug_feats, drug_mask = pad_stack(drug_feats)
     drug_coords, _ = pad_stack(drug_coords)
@@ -181,7 +209,7 @@ def collate_fn(batch, tokenizer, max_len=128):
     labels[attention_mask == 0] = -100
 
     return (
-        pocket_feats,
+        pocket_tokens,
         pocket_coords,
         pocket_mask,
         drug_feats,

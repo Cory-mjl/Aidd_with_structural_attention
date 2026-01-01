@@ -20,6 +20,7 @@ def info_nce(z1, z2, temp=0.07):
 
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("inf")):
+    # Standard nucleus/top-k filtering for sampling.
     if top_k > 0:
         top_k = min(top_k, logits.size(-1))
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]

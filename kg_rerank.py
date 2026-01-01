@@ -17,6 +17,7 @@ def load_kg_triples(path):
 
 
 def load_embedding_index(ids_path, emb_path):
+    # Load node ids + embeddings, normalize for cosine similarity.
     with open(ids_path, "r", encoding="utf-8") as f:
         ids = [line.strip() for line in f if line.strip()]
     embs = np.load(emb_path)
@@ -29,6 +30,7 @@ def load_embedding_index(ids_path, emb_path):
 
 
 def build_degree(triples, id_to_idx):
+    # Simple undirected degree count as a KG prior.
     deg = torch.zeros(len(id_to_idx), dtype=torch.float)
     for h, _, t in triples:
         if h in id_to_idx:
@@ -39,6 +41,7 @@ def build_degree(triples, id_to_idx):
 
 
 def smiles_to_morgan(smiles_list, n_bits=2048, radius=2):
+    # Fallback query embedding if KG embeddings are fingerprint-based.
     embs = []
     for smi in smiles_list:
         mol = Chem.MolFromSmiles(smi)

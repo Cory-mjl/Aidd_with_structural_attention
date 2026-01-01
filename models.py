@@ -24,6 +24,7 @@ class StructAttnBlock(nn.Module):
         v = self.v(feats).view(B, N, H, dh).transpose(1, 2)
 
         sim = (q @ k.transpose(-2, -1)) / (dh ** 0.5)
+        # Distance-weighted attention for structure awareness.
         dist = torch.cdist(coords, coords)
         dist_w = torch.exp(-dist ** 2 / 10.0).unsqueeze(1)
 
@@ -39,11 +40,13 @@ class StructAttnBlock(nn.Module):
 
 
 class PocketEncoder(nn.Module):
-    def __init__(self, in_dim, hid_dim, n_heads=4):
+    def __init__(self, vocab_size, hid_dim, n_heads=4, pad_idx=0):
         super().__init__()
-        self.block = StructAttnBlock(in_dim, hid_dim, n_heads=n_heads)
+        self.emb = nn.Embedding(vocab_size, hid_dim, padding_idx=pad_idx)
+        self.block = StructAttnBlock(hid_dim, hid_dim, n_heads=n_heads)
 
-    def forward(self, feats, coords, mask=None):
+    def forward(self, token_ids, coords, mask=None):
+        feats = self.emb(token_ids)
         return self.block(feats, coords, mask=mask)
 
 
@@ -61,6 +64,7 @@ class CrossAttnAdapter(nn.Module):
         super().__init__()
         self.ln = nn.LayerNorm(hid_dim)
         self.cross = nn.MultiheadAttention(hid_dim, n_heads, batch_first=True)
+        # Gated residual to avoid overpowering the base LM.
         self.alpha = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, h, memory, memory_mask=None):
@@ -86,6 +90,7 @@ class MolGPTWithCrossAttn(nn.Module):
 
     def forward(self, input_ids, attention_mask, pocket_mem, pocket_mask=None):
         if hasattr(self.lm, "transformer"):
+            # GPT2-style forward to get hidden states for adapter injection.
             h = self.lm.transformer(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
             h = self.adapter(h, pocket_mem, memory_mask=pocket_mask)
             logits = self.lm.lm_head(h)
@@ -98,15 +103,15 @@ class MolGPTWithCrossAttn(nn.Module):
 
 
 class Pocket2SmilesModel(nn.Module):
-    def __init__(self, feat_dim, hid_dim, model_path, n_heads=4):
+    def __init__(self, drug_feat_dim, hid_dim, model_path, n_heads=4, protein_vocab_size=0, protein_pad_idx=0):
         super().__init__()
-        self.pocket_enc = PocketEncoder(feat_dim, hid_dim, n_heads=n_heads)
-        self.drug_enc = DrugEncoder(feat_dim, hid_dim, n_heads=n_heads)
+        self.pocket_enc = PocketEncoder(protein_vocab_size, hid_dim, n_heads=n_heads, pad_idx=protein_pad_idx)
+        self.drug_enc = DrugEncoder(drug_feat_dim, hid_dim, n_heads=n_heads)
         self.decoder = MolGPTWithCrossAttn(model_path, n_heads=n_heads)
 
     def forward(
         self,
-        pocket_feats,
+        pocket_tokens,
         pocket_coords,
         pocket_mask,
         drug_feats,
@@ -115,7 +120,7 @@ class Pocket2SmilesModel(nn.Module):
         input_ids,
         attention_mask,
     ):
-        pocket_mem = self.pocket_enc(pocket_feats, pocket_coords, mask=pocket_mask)
+        pocket_mem = self.pocket_enc(pocket_tokens, pocket_coords, mask=pocket_mask)
         drug_mem = self.drug_enc(drug_feats, drug_coords, mask=drug_mask)
         logits = self.decoder(input_ids, attention_mask, pocket_mem, pocket_mask=pocket_mask)
         return logits, pocket_mem, drug_mem

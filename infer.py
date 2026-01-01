@@ -15,20 +15,21 @@ from .config import (
     KG_TOPK,
     KG_DEG_WEIGHT,
 )
-from .data import CrossDockedPocket10Dataset
+from .data import CrossDockedPocket10Dataset, ProteinTokenizer
 from .models import Pocket2SmilesModel
 from .kg_rerank import load_kg_triples, load_embedding_index, build_degree, smiles_to_morgan, KGReranker
 from .utils import top_k_top_p_filtering, smiles_valid
 
 
 @torch.no_grad()
-def sample_smiles(model, pocket_feats, pocket_coords, pocket_mask, max_len=128, top_k=40, top_p=0.9):
+def sample_smiles(model, pocket_tokens, pocket_coords, pocket_mask, max_len=128, top_k=40, top_p=0.9):
     model.eval()
-    device = pocket_feats.device
+    device = pocket_tokens.device
     tokenizer = model.decoder.tokenizer
 
-    pocket_mem = model.pocket_enc(pocket_feats, pocket_coords, mask=pocket_mask)
-    input_ids = torch.full((pocket_feats.size(0), 1), tokenizer.bos_token_id or tokenizer.eos_token_id, device=device)
+    # Precompute pocket memory for decoding.
+    pocket_mem = model.pocket_enc(pocket_tokens, pocket_coords, mask=pocket_mask)
+    input_ids = torch.full((pocket_tokens.size(0), 1), tokenizer.bos_token_id or tokenizer.eos_token_id, device=device)
     attention_mask = torch.ones_like(input_ids)
 
     for _ in range(max_len - 1):
@@ -53,19 +54,27 @@ def infer_one(index=0, checkpoint_path=None):
         subset="test",
         subdir=CROSSDOCK_SUBDIR,
     )
-    feat_dim = dataset[0][0].size(-1)
+    drug_feat_dim = dataset[0][2].size(-1)
+    protein_tokenizer = ProteinTokenizer()
 
-    model = Pocket2SmilesModel(feat_dim=feat_dim, hid_dim=HID_DIM, model_path=MODEL_PATH, n_heads=N_HEADS).to(device)
+    model = Pocket2SmilesModel(
+        drug_feat_dim=drug_feat_dim,
+        hid_dim=HID_DIM,
+        model_path=MODEL_PATH,
+        n_heads=N_HEADS,
+        protein_vocab_size=protein_tokenizer.vocab_size,
+        protein_pad_idx=protein_tokenizer.pad_idx,
+    ).to(device)
     if checkpoint_path:
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     # use dataset sample to build pocket input
-    pocket_feats, pocket_coords, _, _, _ = dataset[index]
-    pocket_feats = pocket_feats.unsqueeze(0).to(device)
+    pocket_seq, pocket_coords, _, _, _ = dataset[index]
+    pocket_tokens = protein_tokenizer.encode(pocket_seq).unsqueeze(0).to(device)
     pocket_coords = pocket_coords.unsqueeze(0).to(device)
-    pocket_mask = torch.ones(pocket_feats.size()[:2], dtype=torch.bool, device=device)
+    pocket_mask = torch.ones(pocket_tokens.size()[:2], dtype=torch.bool, device=device)
 
-    smiles = sample_smiles(model, pocket_feats, pocket_coords, pocket_mask, max_len=MAX_LEN)
+    smiles = sample_smiles(model, pocket_tokens, pocket_coords, pocket_mask, max_len=MAX_LEN)
     smiles = [s for s in smiles if smiles_valid(s)]
 
     if os.path.exists(KG_NODE_IDS_PATH) and os.path.exists(KG_NODE_EMB_PATH):
